@@ -15,10 +15,14 @@ from app.database import get_db
 from app.config import settings
 from app.models.user import User
 from app.models.cliente import Cliente
-from app.models.orden_venta import OrdenVenta
+from app.models.orden_venta import OrdenVenta, DetalleVenta
 from app.models.pago import Pago
+from app.models.stock_inventario import StockInventario
 from app.models.qr_pago_config import QRPagoConfig
 from app.models.empresa import Empresa
+from app.models.permission import Permission
+from app.models.role import Role
+from app.models.role_permission import RolePermission
 from app.schemas.pago_envio import (
     PagoCreateRequest,
     PagoResponse,
@@ -29,6 +33,8 @@ from app.schemas.pago_envio import (
     CobroCajaResponse,
     QRConfigDTO,
     QRConfigResponse,
+    OfflineCheckoutPreview,
+    OfflineCheckoutStartResponse,
 )
 from app.api.deps import get_current_user, get_optional_current_user, require_permission, require_plan_capability
 from app.core.exceptions import NotFoundException, BadRequestException
@@ -37,8 +43,92 @@ from app.services.paypal_service import paypal_service
 from app.services.tenant_scope import effective_empresa_id, scope_by_sucursal
 from app.services.pago_service import PagoService
 from app.services.payment_reconciliation_service import PaymentReconciliationService
+from app.services.offline_checkout_service import OfflineCheckoutService
+from app.services.promocion_service import PromocionService
+from app.services.plan_service import PlanService
+from app.services.notificacion_service import NotificacionService
 
 router = APIRouter(prefix="/pagos", tags=["Pagos"])
+
+
+def _offline_checkout_context(token: str, db: Session) -> dict:
+    """Resolve and revalidate every boundary encoded in a public checkout link."""
+    claims = OfflineCheckoutService.decode_token(token)
+    user = db.query(User).filter(
+        User.id == claims["user_id"],
+        User.empresa_id == claims["empresa_id"],
+        User.role == "cliente",
+        User.is_active.is_(True),
+    ).first()
+    if not user:
+        raise BadRequestException("La cuenta asociada a este enlace ya no está disponible.")
+
+    empresa = db.query(Empresa).filter(Empresa.id == claims["empresa_id"]).first()
+    if not empresa or not empresa.active:
+        raise BadRequestException("La tienda asociada a este enlace no está disponible temporalmente.")
+
+    PlanService(db).require_capability(user, "ventas")
+    has_permission = (
+        db.query(RolePermission)
+        .join(Permission, RolePermission.permission_id == Permission.id)
+        .join(Role, RolePermission.role_id == Role.id)
+        .filter(
+            Permission.code == "ventas.comprar",
+            RolePermission.role_id == user.role_id,
+            Role.active.is_(True),
+            Role.empresa_id == user.empresa_id,
+        )
+        .first()
+    )
+    if not has_permission:
+        raise BadRequestException("Las compras no están disponibles temporalmente en esta tienda.")
+
+    cliente = db.query(Cliente).filter(Cliente.user_id == user.id).first()
+    stock = db.query(StockInventario).filter(StockInventario.id == claims["stock_id"]).first()
+    if not cliente or not stock or not stock.sucursal or not stock.producto_color:
+        raise BadRequestException("La prenda preparada ya no está disponible.")
+    producto = stock.producto_color.producto
+    if stock.sucursal.empresa_id != claims["empresa_id"] or producto.empresa_id != claims["empresa_id"]:
+        raise BadRequestException("El enlace no pertenece a esta tienda.")
+
+    _, precio, _ = PromocionService(db).precio_stock(stock)
+    cantidad = claims["quantity"]
+    total = Decimal(precio * cantidad).quantize(Decimal("0.01"))
+    operation_uuid = OfflineCheckoutService.operation_uuid(token)
+    pago = db.query(Pago).filter(Pago.operation_uuid == operation_uuid).first()
+    orden = pago.orden_venta if pago else None
+    estado = pago.estado if pago else ("agotado" if stock.cantidad < cantidad else "preparado")
+    return {
+        "user": user,
+        "cliente": cliente,
+        "stock": stock,
+        "producto": producto,
+        "cantidad": cantidad,
+        "precio": precio,
+        "total": total,
+        "operation_uuid": operation_uuid,
+        "pago": pago,
+        "orden": orden,
+        "estado": estado,
+    }
+
+
+def _offline_checkout_payload(context: dict) -> dict:
+    stock = context["stock"]
+    user = context["user"]
+    return {
+        "producto": context["producto"].nombre,
+        "color": getattr(stock.producto_color.color, "nombre", None),
+        "talla": getattr(stock.talla, "nombre", None),
+        "sucursal": stock.sucursal.name,
+        "cantidad": context["cantidad"],
+        "precio_unitario": context["precio"],
+        "total": context["total"],
+        "moneda": "BOB",
+        "cliente": f"{user.name} {user.apellido or ''}".strip(),
+        "estado": context["estado"],
+        "orden_venta_id": context["orden"].id if context["orden"] else None,
+    }
 
 
 def _payment_company_id(order: OrdenVenta, current_user: User | None = None) -> int:
@@ -93,6 +183,121 @@ async def get_paypal_status(
         "mock_enabled": settings.ALLOW_MOCK_PAYPAL,
         "ready_for_sandbox": configured and paypal_service.mode == "sandbox",
         "bob_per_usd": settings.PAYPAL_BOB_PER_USD,
+    }
+
+
+@router.get(
+    "/paypal/offline/{token}",
+    response_model=OfflineCheckoutPreview,
+    summary="Consultar una compra offline preparada",
+)
+async def get_offline_checkout(token: str, db: Session = Depends(get_db)):
+    """Public preview safe to open on a second device; it exposes no credentials."""
+    return _offline_checkout_payload(_offline_checkout_context(token, db))
+
+
+@router.post(
+    "/paypal/offline/{token}/crear-orden",
+    response_model=OfflineCheckoutStartResponse,
+    summary="Iniciar PayPal para una compra offline preparada",
+)
+async def create_offline_paypal_order(token: str, db: Session = Depends(get_db)):
+    """Create an idempotent PayPal order owned by the client encoded in the signed link."""
+    context = _offline_checkout_context(token, db)
+    existing_payment = context["pago"]
+    if existing_payment:
+        payload = _offline_checkout_payload(context)
+        if not existing_payment.paypal_order_id:
+            raise BadRequestException("El cobro preparado no tiene una orden PayPal válida.")
+        return {
+            **payload,
+            "paypal_order_id": existing_payment.paypal_order_id,
+            "approve_url": OfflineCheckoutService.approval_url(existing_payment.paypal_order_id),
+            "paypal_total": None,
+            "paypal_currency": None,
+        }
+
+    stock = context["stock"]
+    if stock.cantidad < context["cantidad"]:
+        raise BadRequestException(
+            "La prenda se agotó antes de iniciar el pago. No se realizó ningún cobro."
+        )
+
+    orden = OrdenVenta(
+        client_operation_uuid=context["operation_uuid"],
+        fecha=datetime.now().date(),
+        estado="pendiente_pago",
+        total=context["total"],
+        subtotal_productos=context["total"],
+        tipo_venta="en linea",
+        codigo_cliente=context["cliente"].codigo,
+        comprador_nombre=context["cliente"].nombre,
+        sucursal_id=stock.sucursal_id,
+        metodo_pago="PAYPAL",
+        inventario_descontado=False,
+        tipo_entrega="recojo",
+    )
+    detalle = DetalleVenta(
+        orden_venta=orden,
+        stock_inventario_id=stock.id,
+        producto_nombre=context["producto"].nombre,
+        color_nombre=getattr(stock.producto_color.color, "nombre", None),
+        talla_nombre=getattr(stock.talla, "nombre", None),
+        cantidad=context["cantidad"],
+        precio_unitario=context["precio"],
+        subtotal=context["total"],
+    )
+    db.add_all([orden, detalle])
+    try:
+        db.flush()
+        order_data = await paypal_service.create_order(
+            orden_id=orden.id,
+            total=orden.total,
+            return_url=f"{settings.FRONTEND_URL.rstrip('/')}/paypal-return?offline_checkout=1",
+            cancel_url=f"{OfflineCheckoutService.public_url(token)}?cancelado=1",
+            currency="BOB",
+            reference_prefix="OFFLINE",
+            description=f"{context['producto'].nombre} · compra offline #{orden.id}",
+            allow_fallback=settings.ALLOW_MOCK_PAYPAL,
+        )
+        paypal_order_id = order_data.get("id")
+        if not paypal_order_id:
+            raise RuntimeError("PayPal no devolvió un identificador de orden.")
+        payment = Pago(
+            orden_venta_id=orden.id,
+            empresa_id=context["user"].empresa_id,
+            monto=orden.total,
+            tipo_pago="en linea",
+            metodo_pago="paypal",
+            estado="pendiente",
+            paypal_order_id=paypal_order_id,
+            operation_uuid=context["operation_uuid"],
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(orden)
+    except Exception as exc:
+        db.rollback()
+        raise BadRequestException(f"No se pudo preparar el cobro con PayPal: {exc}") from exc
+
+    NotificacionService(db).notificar_nueva_venta_online(orden)
+    BitacoraService.registrar(
+        db,
+        context["user"],
+        f"Preparó compra offline vinculada a la orden #{orden.id}",
+        "Pagos PayPal",
+    )
+    context.update({"pago": payment, "orden": orden, "estado": "pendiente"})
+    approve_url = next(
+        (link.get("href") for link in order_data.get("links", []) if link.get("rel") == "approve"),
+        OfflineCheckoutService.approval_url(paypal_order_id),
+    )
+    return {
+        **_offline_checkout_payload(context),
+        "paypal_order_id": paypal_order_id,
+        "approve_url": approve_url,
+        "paypal_total": order_data.get("paypal_total"),
+        "paypal_currency": order_data.get("paypal_currency"),
     }
 
 @router.post("/paypal/crear-orden", summary="Crear orden en PayPal Orders v2", dependencies=[Depends(require_plan_capability("ventas")), Depends(require_permission("ventas.comprar"))])

@@ -56,6 +56,27 @@ class PayPalReconciliationItem(BaseModel):
     mensaje: str
 
 
+class OfflineCheckoutPreview(BaseModel):
+    producto: str
+    color: str | None = None
+    talla: str | None = None
+    sucursal: str
+    cantidad: int
+    precio_unitario: Decimal
+    total: Decimal
+    moneda: str = "BOB"
+    cliente: str
+    estado: str = "preparado"
+    orden_venta_id: int | None = None
+
+
+class OfflineCheckoutStartResponse(OfflineCheckoutPreview):
+    paypal_order_id: str
+    approve_url: str
+    paypal_total: str | None = None
+    paypal_currency: str | None = None
+
+
 class CobroCajaRequest(BaseModel):
     orden_venta_id: int
     efectivo_recibido: Decimal = Field(..., ge=Decimal("0"))

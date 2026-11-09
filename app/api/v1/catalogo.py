@@ -21,6 +21,7 @@ from app.api.deps import get_current_user, get_optional_current_user
 from app.core.exceptions import NotFoundException
 from app.services.promocion_service import PromocionService
 from app.services.catalog_pdf_service import CatalogPdfService
+from app.services.offline_checkout_service import OfflineCheckoutService
 from app.services.tenant_scope import effective_empresa_id
 
 router = APIRouter(prefix="/catalogo", tags=["Catálogo"])
@@ -99,6 +100,17 @@ async def get_catalogo(
             for s in stocks:
                 stock_total += s.cantidad
                 precio_original, precio_stock, _ = PromocionService(db).precio_stock(s)
+                offline_checkout_links: dict[str, str] = {}
+                if (
+                    current_user
+                    and current_user.role == "cliente"
+                    and not current_user.is_platform_admin
+                    and current_user.empresa_id == empresa_id
+                    and s.cantidad > 0
+                ):
+                    for quantity in range(1, min(s.cantidad, 5) + 1):
+                        token = OfflineCheckoutService.create_token(current_user, s.id, quantity)
+                        offline_checkout_links[str(quantity)] = OfflineCheckoutService.public_url(token)
                 tallas_stock.append({
                     "stock_inventario_id": s.id,
                     "talla_id": s.talla_id,
@@ -111,6 +123,7 @@ async def get_catalogo(
                     "precio_original": float(precio_original),
                     "precio_variante": float(s.precio_variante) if s.precio_variante is not None else None,
                     "medidas": s.medidas or {},
+                    "offline_checkout_links": offline_checkout_links,
                 })
 
             if pc.color:
@@ -238,6 +251,17 @@ async def get_producto_detalle(
             for s in stocks:
                 stock_total += s.cantidad
                 precio_original, precio_stock, _ = PromocionService(db).precio_stock(s)
+                offline_checkout_links: dict[str, str] = {}
+                if (
+                    current_user
+                    and current_user.role == "cliente"
+                    and not current_user.is_platform_admin
+                    and current_user.empresa_id == empresa_id
+                    and s.cantidad > 0
+                ):
+                    for quantity in range(1, min(s.cantidad, 5) + 1):
+                        token = OfflineCheckoutService.create_token(current_user, s.id, quantity)
+                        offline_checkout_links[str(quantity)] = OfflineCheckoutService.public_url(token)
                 tallas_stock.append({
                     "stock_inventario_id": s.id,
                     "talla_id": s.talla_id,
@@ -250,6 +274,7 @@ async def get_producto_detalle(
                     "precio_original": float(precio_original),
                     "precio_variante": float(s.precio_variante) if s.precio_variante is not None else None,
                     "medidas": s.medidas or {},
+                    "offline_checkout_links": offline_checkout_links,
                 })
 
             if pc.color:
