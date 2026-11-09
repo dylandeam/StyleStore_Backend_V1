@@ -5,7 +5,7 @@ import { defineRailway, github, project, service } from "railway/iac";
 export const partial = "StyleStore_Backend";
 export default defineRailway(() => {
   const StyleStore_Backend = service("StyleStore_Backend", {
-    source: github("dylandeam/StyleStore_Backend", { branch: "main", checkSuites: false }),
+    source: github("dylandeam/StyleStore_Backend_V1", { branch: "main", checkSuites: false }),
     build: { buildEnvironment: "V3", builder: "NIXPACKS" },
     start: "sh -c 'alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'",
     replicas: { "iad": 1 },
