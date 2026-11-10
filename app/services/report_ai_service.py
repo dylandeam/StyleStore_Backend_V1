@@ -20,6 +20,9 @@ from app.models.envio import Envio
 from app.models.stock_inventario import StockInventario
 from app.models.cliente import Cliente
 from app.models.user import User
+from app.models.reserva import Reserva
+from app.models.cambio_devolucion import CambioDevolucion
+from app.models.compra import Compra
 from app.config import settings
 from app.services.tenant_scope import effective_empresa_id, scope_by_empresa, scope_by_sucursal
 
@@ -274,6 +277,7 @@ class ReportAIService:
         inicio_serie = inicio_semana_actual - timedelta(weeks=7)
         ordenes_periodo = (
             self._orders(self.db.query(OrdenVenta))
+            .options(selectinload(OrdenVenta.detalles), joinedload(OrdenVenta.sucursal))
             .filter(OrdenVenta.fecha >= inicio_serie, OrdenVenta.estado != "cancelada")
             .all()
         )
@@ -289,6 +293,103 @@ class ReportAIService:
                 "ventas_bs": round(sum(float(o.total or 0) for o in ordenes), 2),
                 "ordenes": len(ordenes),
             })
+
+        prendas = {}
+        clientes = {}
+        for orden in ordenes_periodo:
+            es_semana = orden.fecha >= inicio_semana_actual
+            es_mes = orden.fecha >= primer_dia_mes
+            cliente_key = orden.codigo_cliente or orden.comprador_nombre or "Sin identificar"
+            cliente = clientes.setdefault(cliente_key, {
+                "cliente": orden.comprador_nombre or orden.codigo_cliente or "Sin identificar",
+                "compras": 0,
+                "total_bs": 0.0,
+            })
+            cliente["compras"] += 1
+            cliente["total_bs"] += float(orden.total or 0)
+            for detalle in orden.detalles:
+                nombre = detalle.producto_nombre or "Prenda"
+                item = prendas.setdefault(nombre, {
+                    "prenda": nombre,
+                    "unidades_semana": 0,
+                    "unidades_mes": 0,
+                    "unidades_periodo": 0,
+                    "ingresos_semana": 0.0,
+                    "ingresos_mes": 0.0,
+                    "ingresos_periodo": 0.0,
+                })
+                cantidad = int(detalle.cantidad or 0)
+                item["unidades_periodo"] += cantidad
+                ingreso = float(detalle.subtotal or 0)
+                item["ingresos_periodo"] += ingreso
+                if es_semana:
+                    item["unidades_semana"] += cantidad
+                    item["ingresos_semana"] += ingreso
+                if es_mes:
+                    item["unidades_mes"] += cantidad
+                    item["ingresos_mes"] += ingreso
+
+        stocks = (
+            scope_by_sucursal(
+                self.db.query(StockInventario), self.db, self.current_user,
+                StockInventario.sucursal_id,
+            )
+            .options(
+                joinedload(StockInventario.sucursal),
+                joinedload(StockInventario.producto_color)
+                .joinedload(ProductoColor.producto)
+                .joinedload(Producto.categoria),
+            )
+            .all()
+        )
+        stock_sucursal = {}
+        stock_categoria = {}
+        for stock in stocks:
+            cantidad = int(stock.cantidad or 0)
+            sucursal = stock.sucursal.nombre if stock.sucursal else "Sin sucursal"
+            producto = stock.producto_color.producto if stock.producto_color else None
+            categoria = producto.categoria.nombre if producto and producto.categoria else "Sin categoría"
+            stock_sucursal[sucursal] = stock_sucursal.get(sucursal, 0) + cantidad
+            stock_categoria[categoria] = stock_categoria.get(categoria, 0) + cantidad
+
+        # Dominios operativos adicionales para que el mismo contrato de
+        # visualización sirva a reservas, postventa y abastecimiento.
+        reservas = scope_by_sucursal(
+            self.db.query(Reserva), self.db, self.current_user, Reserva.sucursal_id
+        ).all()
+        reservas_estado = {}
+        for reserva in reservas:
+            estado = (reserva.estado or "sin estado").replace("_", " ").title()
+            reservas_estado[estado] = reservas_estado.get(estado, 0) + 1
+
+        cambios = scope_by_sucursal(
+            self.db.query(CambioDevolucion), self.db, self.current_user,
+            CambioDevolucion.sucursal_id,
+        ).all()
+        cambios_estado = {}
+        cambios_tipo = {}
+        for cambio in cambios:
+            estado = (cambio.estado or "sin estado").replace("_", " ").title()
+            tipo = (cambio.tipo or "sin tipo").replace("_", " ").title()
+            cambios_estado[estado] = cambios_estado.get(estado, 0) + 1
+            cambios_tipo[tipo] = cambios_tipo.get(tipo, 0) + 1
+
+        compras = scope_by_sucursal(
+            self.db.query(Compra), self.db, self.current_user, Compra.sucursal_id
+        ).options(joinedload(Compra.proveedor)).filter(Compra.estado != "anulada").all()
+        compras_proveedor = {}
+        for compra in compras:
+            proveedor = compra.proveedor.nombre if compra.proveedor else compra.proveedor_codigo
+            item = compras_proveedor.setdefault(proveedor, {"compras": 0, "total_bs": 0.0})
+            item["compras"] += 1
+            item["total_bs"] += float(compra.total or 0)
+
+        ventas_por_dia = {}
+        for orden in ordenes_periodo:
+            key = orden.fecha.isoformat()
+            item = ventas_por_dia.setdefault(key, {"ventas_bs": 0.0, "ordenes": 0})
+            item["ventas_bs"] += float(orden.total or 0)
+            item["ordenes"] += 1
 
         return {
             "fecha_actual": hoy_bo.isoformat(),
@@ -313,6 +414,19 @@ class ReportAIService:
             "pagos_hoy": pagos_hoy_map,
             "recaudacion_mes_total": float(recaudacion_mes_total or 0.0),
             "ventas_por_semana": semanas,
+            "prendas_ranking": sorted(prendas.values(), key=lambda row: row["unidades_periodo"], reverse=True),
+            "clientes_ranking": sorted(clientes.values(), key=lambda row: row["total_bs"], reverse=True),
+            "stock_por_sucursal": [{"nombre": key, "unidades": value} for key, value in stock_sucursal.items()],
+            "stock_por_categoria": [{"nombre": key, "unidades": value} for key, value in stock_categoria.items()],
+            "reservas_por_estado": [{"estado": key, "cantidad": value} for key, value in reservas_estado.items()],
+            "cambios_por_estado": [{"estado": key, "cantidad": value} for key, value in cambios_estado.items()],
+            "cambios_por_tipo": [{"tipo": key, "cantidad": value} for key, value in cambios_tipo.items()],
+            "compras_por_proveedor": [
+                {"proveedor": key, **value} for key, value in compras_proveedor.items()
+            ],
+            "ventas_por_dia": [
+                {"fecha": key, **value} for key, value in sorted(ventas_por_dia.items())
+            ],
         }
 
     def procesar_consulta(self, pregunta: str, user_name: str = "Administrador") -> Dict[str, Any]:
@@ -496,9 +610,152 @@ KPIS: [{{"label": "Vendido Hoy", "valor": "Bs. 0.00"}}, {{"label": "Prendas Vend
             "contexto": self._recopilar_contexto_operativo(),
         }
 
+    @staticmethod
+    def _visual_response(
+        pregunta: str,
+        titulo: str,
+        unidad: str,
+        columnas: List[str],
+        filas: List[List[Any]],
+        valor_index: int = 1,
+    ) -> Dict[str, Any]:
+        filas = filas[:12]
+        return {
+            "pregunta": pregunta,
+            "respuesta": f"{titulo}. Datos calculados directamente desde las operaciones del tenant activo.",
+            "kpis": [
+                {"label": "Registros mostrados", "valor": str(len(filas))},
+                {"label": "Fuente", "valor": "Base de datos"},
+            ],
+            "visualizacion": {
+                "tipo": "tabla" if "tabla" in pregunta.lower() else "barras",
+                "titulo": titulo,
+                "unidad": unidad,
+                "columnas": columnas,
+                "filas": filas,
+                "etiquetas": [str(row[0]) for row in filas],
+                "series": [{
+                    "nombre": columnas[valor_index],
+                    "valores": [float(row[valor_index] or 0) for row in filas],
+                }],
+            },
+            "ia_powered": False,
+        }
+
+    def _generar_visualizacion_dinamica(
+        self, pregunta: str, ctx: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        p = pregunta.lower()
+
+        if any(word in p for word in ("prenda", "prendas", "ropa", "producto", "productos")) \
+                and any(word in p for word in ("vendid", "popular", "ranking", "más", "mas")):
+            periodo = "unidades_semana" if "semana" in p else "unidades_mes" if "mes" in p else "unidades_periodo"
+            ingreso_periodo = periodo.replace("unidades_", "ingresos_")
+            etiqueta_periodo = "esta semana" if periodo == "unidades_semana" else "este mes" if periodo == "unidades_mes" else "últimas 8 semanas"
+            rows = sorted(ctx["prendas_ranking"], key=lambda row: row[periodo], reverse=True)
+            return self._visual_response(
+                pregunta, f"Prendas más vendidas · {etiqueta_periodo}", "un.",
+                ["Prenda", "Unidades", "Ingresos (Bs.)"],
+                [[row["prenda"], row[periodo], round(row[ingreso_periodo], 2)] for row in rows if row[periodo] > 0],
+            )
+
+        if any(word in p for word in ("stock", "inventario", "existencia")):
+            key = "stock_por_categoria" if "categor" in p else "stock_por_sucursal"
+            dimension = "categoría" if key == "stock_por_categoria" else "sucursal"
+            rows = sorted(ctx[key], key=lambda row: row["unidades"], reverse=True)
+            return self._visual_response(
+                pregunta, f"Stock por {dimension}", "un.",
+                [dimension.capitalize(), "Unidades"],
+                [[row["nombre"], row["unidades"]] for row in rows],
+            )
+
+        if any(word in p for word in ("reserva", "reservas")):
+            rows = sorted(ctx["reservas_por_estado"], key=lambda row: row["cantidad"], reverse=True)
+            return self._visual_response(
+                pregunta, "Reservas por estado", "reservas",
+                ["Estado", "Reservas"],
+                [[row["estado"], row["cantidad"]] for row in rows],
+            )
+
+        if any(word in p for word in ("devolución", "devolucion", "devoluciones", "cambio", "cambios", "garantía", "garantia")):
+            por_tipo = any(word in p for word in ("tipo", "cambio vs", "cambios vs"))
+            key = "cambios_por_tipo" if por_tipo else "cambios_por_estado"
+            dimension = "tipo" if por_tipo else "estado"
+            rows = sorted(ctx[key], key=lambda row: row["cantidad"], reverse=True)
+            return self._visual_response(
+                pregunta, f"Cambios y devoluciones por {dimension}", "solicitudes",
+                [dimension.capitalize(), "Solicitudes"],
+                [[row[dimension], row["cantidad"]] for row in rows],
+            )
+
+        if any(word in p for word in ("proveedor", "proveedores", "abastecimiento", "abastecer")):
+            rows = sorted(ctx["compras_por_proveedor"], key=lambda row: row["total_bs"], reverse=True)
+            return self._visual_response(
+                pregunta, "Compras a proveedores", "Bs.",
+                ["Proveedor", "Comprado (Bs.)", "Compras"],
+                [[row["proveedor"], round(row["total_bs"], 2), row["compras"]] for row in rows],
+            )
+
+        if any(word in p for word in ("pago", "pagos", "paypal", "efectivo", "qr", "método", "metodo")):
+            rows = sorted(ctx["pagos_hoy"].items(), key=lambda item: item[1], reverse=True)
+            return self._visual_response(
+                pregunta, "Cobros por método de pago · hoy", "Bs.",
+                ["Método", "Monto (Bs.)"], [[name, round(value, 2)] for name, value in rows],
+            )
+
+        if any(word in p for word in ("delivery", "envío", "envio", "despacho")):
+            delivery = ctx["delivery"]
+            return self._visual_response(
+                pregunta, "Estado de entregas · hoy", "pedidos",
+                ["Estado", "Pedidos"], [
+                    ["Entregados", delivery["entregados_hoy"]],
+                    ["En camino", delivery["en_camino_hoy"]],
+                    ["Pendientes", delivery["pendientes_hoy"]],
+                ],
+            )
+
+        if any(word in p for word in ("cliente", "clientes", "comprador")):
+            return self._visual_response(
+                pregunta, "Clientes con mayor volumen de compra · últimas 8 semanas", "Bs.",
+                ["Cliente", "Comprado (Bs.)", "Órdenes"],
+                [[row["cliente"], round(row["total_bs"], 2), row["compras"]] for row in ctx["clientes_ranking"]],
+            )
+
+        if "sucursal" in p or "sucursales" in p:
+            periodo = "recaudado_hoy" if "hoy" in p else "recaudado_mes"
+            label = "hoy" if periodo == "recaudado_hoy" else "este mes"
+            rows = sorted(ctx["sucursales"], key=lambda row: row[periodo], reverse=True)
+            return self._visual_response(
+                pregunta, f"Ventas por sucursal · {label}", "Bs.",
+                ["Sucursal", "Ventas (Bs.)"],
+                [[row["nombre"], round(row[periodo], 2)] for row in rows],
+            )
+
+        if any(word in p for word in ("venta", "ventas", "recaudación", "recaudacion", "ingreso", "ingresos")):
+            if any(word in p for word in ("día", "dia", "diario", "diaria", "fecha")):
+                rows = ctx["ventas_por_dia"][-30:]
+                return self._visual_response(
+                    pregunta, "Ventas por día · últimos 30 días con actividad", "Bs.",
+                    ["Fecha", "Ventas (Bs.)", "Órdenes"],
+                    [[row["fecha"], round(row["ventas_bs"], 2), row["ordenes"]] for row in rows],
+                )
+            rows = ctx["ventas_por_semana"]
+            return self._visual_response(
+                pregunta, "Ventas por semana", "Bs.",
+                ["Semana", "Ventas (Bs.)", "Órdenes"],
+                [[row["etiqueta"], row["ventas_bs"], row["ordenes"]] for row in rows],
+            )
+
+        return None
+
     def _generar_respuesta_local(self, pregunta: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
         """Genera respuesta determinística local si el LLM no responde."""
         p_lower = pregunta.lower()
+
+        if any(word in p_lower for word in ("gráfico", "grafico", "tabla")):
+            dynamic = self._generar_visualizacion_dinamica(pregunta, ctx)
+            if dynamic:
+                return dynamic
 
         if "semana" in p_lower and any(w in p_lower for w in ("venta", "ventas", "recaud")):
             rows = ctx.get("ventas_por_semana", [])
@@ -514,7 +771,7 @@ KPIS: [{{"label": "Vendido Hoy", "valor": "Bs. 0.00"}}, {{"label": "Prendas Vend
                     {"label": "Semanas analizadas", "valor": str(len(rows))},
                 ],
                 "visualizacion": {
-                    "tipo": "barras",
+                    "tipo": "tabla" if "tabla" in p_lower else "barras",
                     "titulo": "Ventas por semana",
                     "unidad": "Bs.",
                     "columnas": ["Semana", "Ventas (Bs.)", "Órdenes"],

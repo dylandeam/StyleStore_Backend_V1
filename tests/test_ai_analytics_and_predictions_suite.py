@@ -218,6 +218,24 @@ def test_req038_multi_tenant_operational_context_isolation(db_session: Session):
 
 def test_reporte_semanal_grafico_es_deterministico_y_tenant_scoped(db_session: Session):
     env = _create_isolated_environment(db_session)
+    order = OrdenVenta(
+        codigo_cliente=None,
+        comprador_nombre="Cliente gráfico",
+        sucursal_id=env["suc1"].id,
+        total=Decimal("210.00"),
+        estado="pagada",
+        tipo_venta="presencial",
+        fecha=date.today(),
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add_all([
+        DetalleVenta(orden_venta_id=order.id, producto_nombre="Polo", cantidad=2,
+                     precio_unitario=Decimal("70"), subtotal=Decimal("140")),
+        DetalleVenta(orden_venta_id=order.id, producto_nombre="Camisa", cantidad=1,
+                     precio_unitario=Decimal("70"), subtotal=Decimal("70")),
+    ])
+    db_session.commit()
     service = ReportAIService(db_session, env["admin1"])
 
     first = service.procesar_consulta("Generá un gráfico de ventas por semana")
@@ -230,6 +248,25 @@ def test_reporte_semanal_grafico_es_deterministico_y_tenant_scoped(db_session: S
     assert len(chart["etiquetas"]) == 8
     assert len(chart["series"][0]["valores"]) == 8
     assert first["proveedor_ia"] == "motor_analitico_deterministico"
+
+    products = service.procesar_consulta("Generá un gráfico de las ropas más vendidas esta semana")
+    assert products["visualizacion"]["titulo"].startswith("Prendas más vendidas")
+    assert products["visualizacion"]["etiquetas"][0] == "Polo"
+    assert products["visualizacion"]["series"][0]["valores"][0] == 2
+
+    branches = service.procesar_consulta("Generá una tabla de ventas por sucursal")
+    assert branches["visualizacion"]["titulo"] == "Ventas por sucursal · este mes"
+    assert "Sucursal AI-1" in branches["visualizacion"]["etiquetas"]
+
+    daily = service.procesar_consulta("Generá un gráfico diario de ingresos")
+    assert daily["visualizacion"]["titulo"].startswith("Ventas por día")
+    assert date.today().isoformat() in daily["visualizacion"]["etiquetas"]
+
+    reservations = service.procesar_consulta("Generá un gráfico de reservas por estado")
+    assert reservations["visualizacion"]["titulo"] == "Reservas por estado"
+
+    returns = service.procesar_consulta("Generá una tabla de cambios y devoluciones por tipo")
+    assert returns["visualizacion"]["titulo"] == "Cambios y devoluciones por tipo"
 
 
 def test_req041_input_validation_and_prompt_injection_safety(client: TestClient, db_session: Session):
