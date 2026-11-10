@@ -797,6 +797,12 @@ def test_cambio_entre_variantes_repone_original_y_descuenta_reemplazo(
     assert original_order["cambios_devoluciones"][0]["estado"] == "completada"
     assert original_order["cambios_devoluciones"][0]["talla_reemplazo"] == replacement_size.nombre
 
+    staff_history = client.get("/api/v1/cambios", headers=headers_adm)
+    assert staff_history.status_code == 200, staff_history.text
+    completed_request = next(item for item in staff_history.json() if item["id"] == request_id)
+    assert completed_request["estado"] == "completada"
+    assert completed_request["nota_venta_numero"]
+
 
 def test_dashboard_entrega_detalle_especifico_por_indicador(client: TestClient, auth_tokens, sample_inventory):
     headers = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
