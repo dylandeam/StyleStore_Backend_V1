@@ -16,6 +16,7 @@ from app.config import settings
 from app.models.user import User
 from app.models.cliente import Cliente
 from app.models.orden_venta import OrdenVenta, DetalleVenta
+from app.models.reserva import Reserva
 from app.models.pago import Pago
 from app.models.stock_inventario import StockInventario
 from app.models.qr_pago_config import QRPagoConfig
@@ -49,6 +50,12 @@ from app.services.plan_service import PlanService
 from app.services.notificacion_service import NotificacionService
 
 router = APIRouter(prefix="/pagos", tags=["Pagos"])
+
+
+def _mark_reservation_paid(db: Session, orden: OrdenVenta) -> None:
+    reserva = db.query(Reserva).filter(Reserva.orden_venta_id == orden.id).first()
+    if reserva and reserva.estado == "pendiente_pago":
+        reserva.estado = "pagada_pendiente_entrega"
 
 
 def _offline_checkout_context(token: str, db: Session) -> dict:
@@ -473,6 +480,7 @@ async def process_caja_payment(
     orden.ticket_numero = ticket_num
     orden.efectivo_recibido = monto_recibido
     orden.cambio_devuelto = cambio
+    _mark_reservation_paid(db, orden)
 
     pago = db.query(Pago).filter(Pago.orden_venta_id == orden.id).first()
     if not pago:
@@ -549,6 +557,7 @@ async def process_payment(
 
     orden.estado = "pagada"
     orden.metodo_pago = payload.tipo_pago
+    _mark_reservation_paid(db, orden)
     db.commit()
     db.refresh(pago)
     PagoService(db).confirmar(pago)
@@ -788,6 +797,7 @@ async def confirmar_cobro_online(
     orden.ticket_numero = ticket_num
     orden.efectivo_recibido = orden.total
     orden.cambio_devuelto = Decimal("0.00")
+    _mark_reservation_paid(db, orden)
 
     pago = db.query(Pago).filter(Pago.orden_venta_id == orden.id).first()
     if not pago:

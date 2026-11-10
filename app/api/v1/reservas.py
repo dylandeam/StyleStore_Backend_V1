@@ -3,6 +3,7 @@ Reservas endpoints (v5 sección 16).
 Incluye transacción atómica con descuento automático de inventario.
 """
 from datetime import datetime, date, time, timedelta
+from decimal import Decimal
 from typing import Optional
 from fastapi import APIRouter, Depends, status, Query
 from sqlalchemy import or_
@@ -14,6 +15,7 @@ from app.models.user import User
 from app.models.cliente import Cliente
 from app.models.reserva import Reserva, DetalleReserva
 from app.models.stock_inventario import StockInventario
+from app.models.orden_venta import OrdenVenta, DetalleVenta
 from app.schemas.reserva import (
     ExpirarReservasResponse,
     ReservaCreate,
@@ -26,6 +28,7 @@ from app.core.exceptions import NotFoundException, BadRequestException
 from app.services.bitacora_service import BitacoraService
 from app.services.tenant_scope import get_scoped_sucursal, scope_by_sucursal
 from app.services.agenda_service import hour_blocks
+from app.services.promocion_service import PromocionService
 
 router = APIRouter(prefix="/reservas", tags=["Reservas"])
 
@@ -524,6 +527,75 @@ async def create_reserva(
     return _serialize_reserva(reserva)
 
 
+@router.post(
+    "/{reserva_id}/enviar-a-caja",
+    summary="Convertir reserva en orden pendiente de cobro",
+    dependencies=[Depends(require_permission("reservas.editar"))],
+)
+async def enviar_reserva_a_caja(
+    reserva_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    reserva = scope_by_sucursal(
+        db.query(Reserva).filter(Reserva.id == reserva_id),
+        db,
+        current_user,
+        Reserva.sucursal_id,
+    ).with_for_update(of=Reserva).first()
+    if not reserva:
+        raise NotFoundException("Reserva no encontrada en el tenant activo.")
+    if reserva.orden_venta_id:
+        orden = db.query(OrdenVenta).filter(OrdenVenta.id == reserva.orden_venta_id).first()
+        return {"reserva_id": reserva.id, "orden_venta_id": reserva.orden_venta_id, "estado": reserva.estado, "total": float(orden.total if orden else 0)}
+    if reserva.estado != "pendiente":
+        raise BadRequestException("Solo una reserva pendiente puede enviarse a caja.")
+
+    promo = PromocionService(db)
+    total = Decimal("0.00")
+    lineas = []
+    for detalle in reserva.detalles:
+        stock = detalle.stock_inventario
+        if not stock or stock.sucursal_id != reserva.sucursal_id:
+            raise BadRequestException("La reserva contiene una existencia inválida.")
+        _, precio, _ = promo.precio_stock(stock)
+        producto = stock.producto_color.producto
+        color = stock.producto_color.color
+        subtotal = precio * detalle.cantidad
+        total += subtotal
+        lineas.append((detalle, producto, color, stock.talla, precio, subtotal))
+
+    orden = OrdenVenta(
+        fecha=date.today(),
+        estado="pendiente_pago",
+        total=promo._money(total),
+        subtotal_productos=promo._money(total),
+        tipo_venta="presencial",
+        metodo_pago=None,
+        inventario_descontado=True,
+        codigo_cliente=reserva.codigo_cliente,
+        comprador_nombre=reserva.cliente.nombre if reserva.cliente else None,
+        sucursal_id=reserva.sucursal_id,
+    )
+    db.add(orden)
+    db.flush()
+    for detalle, producto, color, talla, precio, subtotal in lineas:
+        db.add(DetalleVenta(
+            orden_venta_id=orden.id,
+            stock_inventario_id=detalle.stock_inventario_id,
+            producto_nombre=producto.nombre,
+            color_nombre=color.nombre if color else None,
+            talla_nombre=talla.nombre if talla else None,
+            cantidad=detalle.cantidad,
+            precio_unitario=precio,
+            subtotal=subtotal,
+        ))
+    reserva.orden_venta_id = orden.id
+    reserva.estado = "pendiente_pago"
+    db.commit()
+    return {"reserva_id": reserva.id, "orden_venta_id": orden.id, "estado": reserva.estado, "total": float(orden.total)}
+
+
 @router.post("/{reserva_id}/cancelar", response_model=ReservaResponse, summary="Cancelar reserva y restituir stock")
 async def cancelar_reserva(
     reserva_id: int,
@@ -605,6 +677,10 @@ async def update_reserva_estado(
     ).first()
     if not reserva:
         raise NotFoundException(f"Reserva con ID {reserva_id} no encontrada.")
+    if payload.estado == "completada" and reserva.orden_venta_id:
+        orden = db.query(OrdenVenta).filter(OrdenVenta.id == reserva.orden_venta_id).first()
+        if not orden or orden.estado != "pagada":
+            raise BadRequestException("La reserva debe pagarse en caja antes de entregar las prendas.")
 
     # Si se cancela o expira la reserva, restituir el stock atómicamente
     if payload.estado in ["cancelada", "vencida"] and reserva.estado not in ["cancelada", "vencida"]:

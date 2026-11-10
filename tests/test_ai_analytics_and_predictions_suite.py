@@ -216,6 +216,22 @@ def test_req038_multi_tenant_operational_context_isolation(db_session: Session):
     assert context_t1["ventas_hoy"]["total_bs"] < 80000.00
 
 
+def test_reporte_semanal_grafico_es_deterministico_y_tenant_scoped(db_session: Session):
+    env = _create_isolated_environment(db_session)
+    service = ReportAIService(db_session, env["admin1"])
+
+    first = service.procesar_consulta("Generá un gráfico de ventas por semana")
+    second = service.procesar_consulta("Generá un gráfico de ventas por semana")
+
+    assert first["visualizacion"] == second["visualizacion"]
+    chart = first["visualizacion"]
+    assert chart["tipo"] == "barras"
+    assert chart["titulo"] == "Ventas por semana"
+    assert len(chart["etiquetas"]) == 8
+    assert len(chart["series"][0]["valores"]) == 8
+    assert first["proveedor_ia"] == "motor_analitico_deterministico"
+
+
 def test_req041_input_validation_and_prompt_injection_safety(client: TestClient, db_session: Session):
     """REQ-041: Valida límites de preguntas, rechazo de solicitudes vacías y resistencia a inyecciones."""
     env = _create_isolated_environment(db_session)

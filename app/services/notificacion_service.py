@@ -133,7 +133,7 @@ class NotificacionService:
             mensaje=message,
             url_accion=action_url,
             enviar_email=False,
-            enviar_push=False,
+            enviar_push=True,
             empresa_id=operation.empresa_id,
         )
 

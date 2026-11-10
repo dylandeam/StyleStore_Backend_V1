@@ -381,6 +381,54 @@ def test_cliente_nuevo_puede_reservar_sin_compra_previa(client: TestClient, auth
     assert res_re_cancelar.status_code == 400
 
 
+def test_reserva_debe_pagarse_en_caja_antes_de_entrega(client: TestClient, auth_tokens, sample_inventory, db_session):
+    client_headers = {"Authorization": f"Bearer {auth_tokens['client_token']}"}
+    admin_headers = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
+    stock = sample_inventory["stock"]
+    stock.cantidad = 15
+    db_session.commit()
+
+    created = client.post(
+        "/api/v1/reservas",
+        headers=client_headers,
+        json={"sucursal_id": sample_inventory["sucursal"].id,
+              "items": [{"stock_inventario_id": stock.id, "cantidad": 1}]},
+    )
+    assert created.status_code == 201, created.text
+    reserva_id = created.json()["id"]
+    db_session.refresh(stock)
+    assert stock.cantidad == 14
+
+    sent = client.post(f"/api/v1/reservas/{reserva_id}/enviar-a-caja", headers=admin_headers)
+    assert sent.status_code == 200, sent.text
+    order_id = sent.json()["orden_venta_id"]
+    db_session.refresh(stock)
+    assert stock.cantidad == 14, "Enviar a caja no debe descontar dos veces el stock ya reservado"
+
+    premature = client.patch(
+        f"/api/v1/reservas/{reserva_id}/estado",
+        headers=admin_headers,
+        json={"estado": "completada"},
+    )
+    assert premature.status_code == 400
+
+    paid = client.post(
+        "/api/v1/pagos/caja",
+        headers=admin_headers,
+        json={"orden_venta_id": order_id, "efectivo_recibido": 250, "metodo_pago": "efectivo"},
+    )
+    assert paid.status_code == 200, paid.text
+    listed = client.get("/api/v1/reservas", headers=admin_headers).json()
+    assert next(item for item in listed if item["id"] == reserva_id)["estado"] == "pagada_pendiente_entrega"
+
+    delivered = client.patch(
+        f"/api/v1/reservas/{reserva_id}/estado",
+        headers=admin_headers,
+        json={"estado": "completada"},
+    )
+    assert delivered.status_code == 200, delivered.text
+
+
 def test_reserva_respeta_horario_y_maximo_tres_dias(client: TestClient, auth_tokens, sample_inventory, db_session):
     client_headers = {"Authorization": f"Bearer {auth_tokens['client_token']}"}
     admin_headers = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}

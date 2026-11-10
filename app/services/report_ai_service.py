@@ -268,6 +268,28 @@ class ReportAIService:
             .scalar()
         )
 
+        # Serie determinística de ocho semanas. Se agrupa en Python para que el
+        # resultado sea idéntico en PostgreSQL (Railway) y SQLite (pruebas).
+        inicio_semana_actual = hoy_bo - timedelta(days=hoy_bo.weekday())
+        inicio_serie = inicio_semana_actual - timedelta(weeks=7)
+        ordenes_periodo = (
+            self._orders(self.db.query(OrdenVenta))
+            .filter(OrdenVenta.fecha >= inicio_serie, OrdenVenta.estado != "cancelada")
+            .all()
+        )
+        semanas = []
+        for offset in range(8):
+            inicio = inicio_serie + timedelta(weeks=offset)
+            fin = inicio + timedelta(days=6)
+            ordenes = [o for o in ordenes_periodo if inicio <= o.fecha <= fin]
+            semanas.append({
+                "inicio": inicio.isoformat(),
+                "fin": fin.isoformat(),
+                "etiqueta": f"{inicio.strftime('%d/%m')}–{fin.strftime('%d/%m')}",
+                "ventas_bs": round(sum(float(o.total or 0) for o in ordenes), 2),
+                "ordenes": len(ordenes),
+            })
+
         return {
             "fecha_actual": hoy_bo.isoformat(),
             "fecha_actual_legible": hoy_bo.strftime('%d/%m/%Y'),
@@ -290,12 +312,26 @@ class ReportAIService:
             "inventario_critico": inventario_critico_list,
             "pagos_hoy": pagos_hoy_map,
             "recaudacion_mes_total": float(recaudacion_mes_total or 0.0),
+            "ventas_por_semana": semanas,
         }
 
     def procesar_consulta(self, pregunta: str, user_name: str = "Administrador") -> Dict[str, Any]:
         """Procesa la pregunta analítica mediante Groq LLM o motor de cálculo local."""
         pregunta_clean = pregunta.strip()
         contexto = self._recopilar_contexto_operativo()
+
+        # Las solicitudes de gráficos/tablas deben ser reproducibles: sus cifras
+        # salen directamente de la base de datos y no se delegan al LLM.
+        p_lower = pregunta_clean.lower()
+        if any(word in p_lower for word in ("gráfico", "grafico", "tabla")):
+            result = self._generar_respuesta_local(pregunta_clean, contexto)
+            result.update({
+                "modo_ia": "online_local",
+                "proveedor_ia": "motor_analitico_deterministico",
+                "modelo_ia": None,
+                "datos_actualizados_en": datetime.now(timezone.utc).isoformat(),
+            })
+            return result
 
         if settings.GROQ_API_KEY:
             try:
@@ -463,6 +499,34 @@ KPIS: [{{"label": "Vendido Hoy", "valor": "Bs. 0.00"}}, {{"label": "Prendas Vend
     def _generar_respuesta_local(self, pregunta: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
         """Genera respuesta determinística local si el LLM no responde."""
         p_lower = pregunta.lower()
+
+        if "semana" in p_lower and any(w in p_lower for w in ("venta", "ventas", "recaud")):
+            rows = ctx.get("ventas_por_semana", [])
+            total = sum(float(row["ventas_bs"]) for row in rows)
+            return {
+                "pregunta": pregunta,
+                "respuesta": (
+                    "Ventas semanales calculadas directamente desde las órdenes no canceladas "
+                    f"del tenant activo. Total del período: Bs. {total:.2f}."
+                ),
+                "kpis": [
+                    {"label": "Total 8 semanas", "valor": f"Bs. {total:.2f}"},
+                    {"label": "Semanas analizadas", "valor": str(len(rows))},
+                ],
+                "visualizacion": {
+                    "tipo": "barras",
+                    "titulo": "Ventas por semana",
+                    "unidad": "Bs.",
+                    "columnas": ["Semana", "Ventas (Bs.)", "Órdenes"],
+                    "filas": [[row["etiqueta"], row["ventas_bs"], row["ordenes"]] for row in rows],
+                    "etiquetas": [row["etiqueta"] for row in rows],
+                    "series": [{
+                        "nombre": "Ventas",
+                        "valores": [row["ventas_bs"] for row in rows],
+                    }],
+                },
+                "ia_powered": False,
+            }
 
         # Prioridad 1: Delivery y Envíos
         if any(w in p_lower for w in ["delivery", "envio", "envíos", "envios", "repartidor", "moto", "despacho"]):
