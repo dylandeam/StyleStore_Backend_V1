@@ -97,6 +97,35 @@ def _serialize_orden(o: OrdenVenta) -> dict:
             "minutos_estimados": env.minutos_estimados,
         }
 
+    cambios = []
+    for item in o.cambios_solicitados:
+        replacement = item.nuevo_stock
+        replacement_product = replacement.producto_color.producto if replacement and replacement.producto_color else None
+        replacement_color = replacement.producto_color.color if replacement and replacement.producto_color else None
+        cambios.append({
+            "id": item.id,
+            "tipo": item.tipo,
+            "motivo": item.motivo,
+            "descripcion_problema": item.descripcion_problema,
+            "estado": item.estado,
+            "respuesta_encargado": item.respuesta_encargado,
+            "fecha_programada": item.fecha_programada,
+            "producto_original": item.detalle_venta.producto_nombre if item.detalle_venta else None,
+            "talla_original": item.detalle_venta.talla_nombre if item.detalle_venta else None,
+            "color_original": item.detalle_venta.color_nombre if item.detalle_venta else None,
+            "producto_reemplazo": replacement_product.nombre if replacement_product else None,
+            "talla_reemplazo": replacement.talla.nombre if replacement and replacement.talla else None,
+            "color_reemplazo": replacement_color.nombre if replacement_color else None,
+            "precio_original": item.precio_original,
+            "precio_nuevo": item.precio_nuevo,
+            "monto_adicional": item.monto_adicional,
+            "monto_reembolsado": item.monto_reembolsado,
+            "nota_venta_numero": item.nota_venta_numero,
+            "orden_ajuste_id": item.orden_ajuste_id,
+            "reponer_prenda_original": item.reponer_prenda_original,
+            "created_at": item.created_at,
+        })
+
     return {
         "id": o.id,
         "fecha": o.fecha,
@@ -140,6 +169,7 @@ def _serialize_orden(o: OrdenVenta) -> dict:
         "sucursal_id": o.sucursal_id,
         "detalles": detalles,
         "envio": envio_dict,
+        "cambios_devoluciones": cambios,
         "created_at": o.created_at,
     }
 

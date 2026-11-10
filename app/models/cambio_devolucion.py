@@ -69,7 +69,7 @@ class CambioDevolucion(Base):
     )
 
     # Relaciones
-    orden_venta = relationship("OrdenVenta", lazy="joined", foreign_keys=[orden_venta_id])
+    orden_venta = relationship("OrdenVenta", lazy="joined", foreign_keys=[orden_venta_id], back_populates="cambios_solicitados")
     detalle_venta = relationship("DetalleVenta", lazy="joined")
     sucursal = relationship("Sucursal", lazy="joined")
     talla_nueva = relationship("Talla", lazy="joined", foreign_keys=[talla_nueva_id])

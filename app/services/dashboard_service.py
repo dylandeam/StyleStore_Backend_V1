@@ -3,6 +3,7 @@ Servicio para métricas y estadísticas del Dashboard de StyleStore (v6 Punto 1)
 Soporta filtrado por sucursal (para encargados de sucursal y administradores).
 """
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import case, func, or_
@@ -35,10 +36,14 @@ class DashboardService:
         role = str(self.current_user.role or "").strip().lower()
         if role == "cliente":
             return ["historial_compras"]
+        operational = [
+            "ventas_sucursal", "historial_compras", "reservas_vigentes",
+            "cambios_devoluciones", "pagos_caja", "pagos_paypal",
+        ]
         if role in {"cajero", "vendedor", "repartidor"}:
-            return ["ventas_sucursal", "historial_compras"]
+            return operational
         if role in {"administrador", "administrador_tenant", "admin_tenant", "encargado", "encargado_sucursal"}:
-            return ["ventas_sucursal", "stock_categoria", "historial_compras"]
+            return [*operational, "stock_categoria"]
         return []
 
     def get_indicator_detail(self, indicator: str, sucursal_id: Optional[int] = None) -> Dict[str, Any]:
@@ -49,7 +54,128 @@ class DashboardService:
             return self._sales_by_branch(sucursal_id)
         if indicator == "stock_categoria":
             return self._stock_by_category(sucursal_id)
+        if indicator == "reservas_vigentes":
+            return self._reservation_history(sucursal_id)
+        if indicator == "cambios_devoluciones":
+            return self._changes_history(sucursal_id)
+        if indicator == "pagos_caja":
+            return self._payments_history(sucursal_id, paypal=False)
+        if indicator == "pagos_paypal":
+            return self._payments_history(sucursal_id, paypal=True)
         return self._purchase_history(sucursal_id)
+
+    @staticmethod
+    def _client_name(client) -> str:
+        if client and getattr(client, "user", None):
+            return f"{client.user.name or ''} {client.user.apellido or ''}".strip() or "Cliente"
+        return getattr(client, "codigo", None) or "Cliente general"
+
+    def _reservation_history(self, sucursal_id: Optional[int]) -> Dict[str, Any]:
+        query = self._scope_branch(self.db.query(Reserva), Reserva.sucursal_id)
+        if sucursal_id:
+            query = query.filter(Reserva.sucursal_id == sucursal_id)
+        reservations = query.order_by(Reserva.created_at.desc(), Reserva.id.desc()).limit(50).all()
+        data = [{
+            "reserva": f"RES-{item.id:05d}",
+            "fecha": item.fecha.isoformat() if item.fecha else "—",
+            "hora": item.hora.strftime("%H:%M") if item.hora else "—",
+            "cliente": self._client_name(item.cliente),
+            "sucursal": item.sucursal.nombre if item.sucursal else "Sin sucursal",
+            "prendas": sum(int(line.cantidad or 0) for line in item.detalles),
+            "estado": item.estado,
+        } for item in reservations]
+        by_status: dict[str, int] = {}
+        for row in data:
+            by_status[row["estado"]] = by_status.get(row["estado"], 0) + 1
+        return {
+            "indicador": "reservas_vigentes",
+            "titulo": "Reservas y disponibilidad comprometida",
+            "descripcion": "Reservas visibles por sucursal, con su horario, prendas apartadas y estado actual.",
+            "grafico": [{"label": key.replace("_", " ").title(), "value": value} for key, value in by_status.items()],
+            "columnas": [
+                {"key": "reserva", "label": "Reserva"}, {"key": "fecha", "label": "Fecha"},
+                {"key": "hora", "label": "Hora"}, {"key": "cliente", "label": "Cliente"},
+                {"key": "sucursal", "label": "Sucursal"}, {"key": "prendas", "label": "Prendas"},
+                {"key": "estado", "label": "Estado"},
+            ],
+            "filas": data,
+        }
+
+    def _changes_history(self, sucursal_id: Optional[int]) -> Dict[str, Any]:
+        query = self._scope_branch(self.db.query(CambioDevolucion), CambioDevolucion.sucursal_id)
+        if sucursal_id:
+            query = query.filter(CambioDevolucion.sucursal_id == sucursal_id)
+        changes = query.order_by(CambioDevolucion.created_at.desc(), CambioDevolucion.id.desc()).limit(50).all()
+        data = []
+        for item in changes:
+            replacement = "Devolución sin reemplazo"
+            if item.tipo == "cambio" and item.nuevo_stock:
+                product = item.nuevo_stock.producto_color.producto if item.nuevo_stock.producto_color else None
+                replacement = product.nombre if product else "Prenda de reemplazo"
+                if item.nuevo_stock.talla:
+                    replacement += f" · {item.nuevo_stock.talla.nombre}"
+            adjustment = Decimal(item.monto_adicional or 0) - Decimal(item.monto_reembolsado or 0)
+            data.append({
+                "solicitud": f"CD-{item.id:05d}",
+                "fecha": item.created_at.date().isoformat() if item.created_at else "—",
+                "cliente": self._client_name(item.orden_venta.cliente if item.orden_venta else None),
+                "tipo": item.tipo.replace("_", " ").title(),
+                "original": item.detalle_venta.producto_nombre if item.detalle_venta else "—",
+                "resultado": replacement,
+                "ajuste": round(float(adjustment), 2),
+                "estado": item.estado,
+            })
+        by_status: dict[str, int] = {}
+        for row in data:
+            by_status[row["estado"]] = by_status.get(row["estado"], 0) + 1
+        return {
+            "indicador": "cambios_devoluciones",
+            "titulo": "Cambios y devoluciones",
+            "descripcion": "Seguimiento de solicitudes, prendas involucradas y diferencias liquidadas en caja.",
+            "grafico": [{"label": key.replace("_", " ").title(), "value": value} for key, value in by_status.items()],
+            "columnas": [
+                {"key": "solicitud", "label": "Solicitud"}, {"key": "fecha", "label": "Fecha"},
+                {"key": "cliente", "label": "Cliente"}, {"key": "tipo", "label": "Tipo"},
+                {"key": "original", "label": "Prenda original"}, {"key": "resultado", "label": "Resultado"},
+                {"key": "ajuste", "label": "Ajuste neto (Bs)"}, {"key": "estado", "label": "Estado"},
+            ],
+            "filas": data,
+        }
+
+    def _payments_history(self, sucursal_id: Optional[int], *, paypal: bool) -> Dict[str, Any]:
+        query = self.db.query(Pago).join(OrdenVenta, Pago.orden_venta_id == OrdenVenta.id)
+        query = self._scope_branch(query, OrdenVenta.sucursal_id)
+        if sucursal_id:
+            query = query.filter(OrdenVenta.sucursal_id == sucursal_id)
+        payments = query.order_by(Pago.created_at.desc(), Pago.id.desc()).limit(100).all()
+        wanted = {"paypal", "en linea", "en_linea", "online"} if paypal else {"efectivo", "cash", "en caja", "qr", "qr_mostrador", "transferencia"}
+        payments = [item for item in payments if (item.metodo_pago or item.tipo_pago or "").strip().lower() in wanted][:50]
+        data = [{
+            "comprobante": item.recibo_numero or f"PAG-{item.id:06d}",
+            "fecha": item.created_at.date().isoformat() if item.created_at else "—",
+            "orden": item.orden_venta.ticket_numero or f"ORD-{item.orden_venta_id:04d}",
+            "cliente": self._client_name(item.orden_venta.cliente),
+            "sucursal": item.orden_venta.sucursal.nombre if item.orden_venta.sucursal else "Sin sucursal",
+            "metodo": (item.metodo_pago or item.tipo_pago or "—").upper(),
+            "estado": item.estado,
+            "monto": round(float(item.monto or 0), 2),
+        } for item in payments]
+        by_date: dict[str, float] = {}
+        for row in data:
+            by_date[row["fecha"]] = round(by_date.get(row["fecha"], 0) + row["monto"], 2)
+        return {
+            "indicador": "pagos_paypal" if paypal else "pagos_caja",
+            "titulo": "Pagos digitales PayPal" if paypal else "Cobros registrados en caja",
+            "descripcion": "Capturas PayPal conciliadas con su orden." if paypal else "Cobros presenciales en efectivo, QR o transferencia.",
+            "grafico": [{"label": key, "value": value} for key, value in sorted(by_date.items())[-10:]],
+            "columnas": [
+                {"key": "comprobante", "label": "Comprobante"}, {"key": "fecha", "label": "Fecha"},
+                {"key": "orden", "label": "Orden"}, {"key": "cliente", "label": "Cliente"},
+                {"key": "sucursal", "label": "Sucursal"}, {"key": "metodo", "label": "Método"},
+                {"key": "estado", "label": "Estado"}, {"key": "monto", "label": "Monto (Bs)"},
+            ],
+            "filas": data,
+        }
 
     def _sales_by_branch(self, sucursal_id: Optional[int]) -> Dict[str, Any]:
         query = (

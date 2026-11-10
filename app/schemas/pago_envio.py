@@ -225,6 +225,30 @@ class DetalleVentaResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CambioDevolucionOrdenResponse(BaseModel):
+    id: int
+    tipo: str
+    motivo: str
+    descripcion_problema: str
+    estado: str
+    respuesta_encargado: str | None = None
+    fecha_programada: date | None = None
+    producto_original: str | None = None
+    talla_original: str | None = None
+    color_original: str | None = None
+    producto_reemplazo: str | None = None
+    talla_reemplazo: str | None = None
+    color_reemplazo: str | None = None
+    precio_original: Decimal | None = None
+    precio_nuevo: Decimal | None = None
+    monto_adicional: Decimal = Decimal("0.00")
+    monto_reembolsado: Decimal = Decimal("0.00")
+    nota_venta_numero: str | None = None
+    orden_ajuste_id: int | None = None
+    reponer_prenda_original: bool = True
+    created_at: datetime | None = None
+
+
 class OrdenVentaResponse(BaseModel):
     id: int
     fecha: date
@@ -263,5 +287,6 @@ class OrdenVentaResponse(BaseModel):
     paypal_capture_id: str | None = None
     paypal_refund_id: str | None = None
     refund_reason: str | None = None
+    cambios_devoluciones: list[CambioDevolucionOrdenResponse] = []
 
     model_config = {"from_attributes": True}

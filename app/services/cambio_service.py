@@ -302,6 +302,11 @@ class CambioService:
         if nuevo_stk:
             nuevo_stk.cantidad -= 1
 
+        # Fuerza ambos movimientos dentro de la misma transacción antes de
+        # liquidar el comprobante. Si cualquier escritura falla, no se marca
+        # la solicitud como completada ni se deja un inventario parcial.
+        self.db.flush()
+
         cliente = solicitud.orden_venta.cliente if solicitud.orden_venta else None
         if not cliente or not cliente.user:
             raise HTTPException(status_code=400, detail="No se pudo identificar al cliente del cambio.")

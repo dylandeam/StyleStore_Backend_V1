@@ -732,6 +732,91 @@ def test_cambio_mayor_exige_y_registra_cobro(client: TestClient, auth_tokens, sa
     assert db_session.query(Pago).filter(Pago.orden_venta_id == orden_ajuste_id, Pago.monto == Decimal("150.00")).one()
 
 
+def test_cambio_entre_variantes_repone_original_y_descuenta_reemplazo(
+    client: TestClient, auth_tokens, sample_inventory, db_session
+):
+    """Regresión: un cambio debe mover las dos existencias, no solo la devuelta."""
+    headers_cli = {"Authorization": f"Bearer {auth_tokens['client_token']}"}
+    headers_adm = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
+    original = sample_inventory["stock"]
+    original.cantidad = 4
+    replacement_size = Talla(
+        nombre=f"Cambio-{original.id}",
+        empresa_id=sample_inventory["producto"].empresa_id,
+    )
+    db_session.add(replacement_size)
+    db_session.flush()
+    replacement = StockInventario(
+        sucursal_id=original.sucursal_id,
+        producto_color_id=original.producto_color_id,
+        talla_id=replacement_size.id,
+        cantidad=7,
+        precio_variante=Decimal("275.00"),
+    )
+    db_session.add(replacement)
+    order = OrdenVenta(
+        fecha=date.today(), estado="pagada", total=Decimal("250.00"), tipo_venta="presencial",
+        codigo_cliente=auth_tokens["client_profile"].codigo, sucursal_id=original.sucursal_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    detail = DetalleVenta(
+        orden_venta_id=order.id, stock_inventario_id=original.id,
+        producto_nombre=sample_inventory["producto"].nombre, cantidad=1,
+        precio_unitario=Decimal("250.00"), subtotal=Decimal("250.00"),
+    )
+    db_session.add(detail)
+    db_session.commit()
+
+    requested = client.post("/api/v1/cambios", json={
+        "orden_venta_id": order.id, "detalle_venta_id": detail.id, "tipo": "cambio",
+        "motivo": "talla_incorrecta", "sucursal_id": original.sucursal_id,
+        "fecha_programada": str(date.today()), "descripcion_problema": "Cambio por otra talla",
+    }, headers=headers_cli)
+    assert requested.status_code == 200, requested.text
+    request_id = requested.json()["solicitud_id"]
+    assert client.put(f"/api/v1/cambios/{request_id}/responder", json={
+        "nuevo_estado": "aceptada", "respuesta_encargado": "Aprobado",
+    }, headers=headers_adm).status_code == 200
+    prepared = client.post(f"/api/v1/cambios/{request_id}/preparar-liquidacion", json={
+        "reponer_prenda_original": True, "nuevo_stock_inventario_id": replacement.id,
+    }, headers=headers_adm)
+    assert prepared.status_code == 200, prepared.text
+    completed = client.post(f"/api/v1/cambios/{request_id}/completar", json={
+        "metodo_pago_diferencia": "efectivo", "efectivo_recibido": 25,
+    }, headers=headers_adm)
+    assert completed.status_code == 200, completed.text
+
+    db_session.expire_all()
+    assert db_session.get(StockInventario, original.id).cantidad == 5
+    assert db_session.get(StockInventario, replacement.id).cantidad == 6
+
+    history = client.get("/api/v1/ventas/mis-compras", headers=headers_cli)
+    assert history.status_code == 200, history.text
+    original_order = next(item for item in history.json() if item["id"] == order.id)
+    assert original_order["cambios_devoluciones"][0]["estado"] == "completada"
+    assert original_order["cambios_devoluciones"][0]["talla_reemplazo"] == replacement_size.nombre
+
+
+def test_dashboard_entrega_detalle_especifico_por_indicador(client: TestClient, auth_tokens, sample_inventory):
+    headers = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
+    expected_titles = {
+        "reservas_vigentes": "Reservas y disponibilidad comprometida",
+        "cambios_devoluciones": "Cambios y devoluciones",
+        "pagos_caja": "Cobros registrados en caja",
+        "pagos_paypal": "Pagos digitales PayPal",
+    }
+    for indicator, title in expected_titles.items():
+        response = client.get(
+            f"/api/v1/reportes/dashboard-indicadores/{indicator}", headers=headers
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["indicador"] == indicator
+        assert body["titulo"] == title
+        assert body["titulo"] != "Historial de ventas"
+
+
 def test_nuevos_reportes_previews(client: TestClient, auth_tokens):
     headers = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
     

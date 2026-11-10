@@ -76,6 +76,12 @@ class OrdenVenta(Base):
         uselist=False,
         lazy="joined",
     )
+    cambios_solicitados = relationship(
+        "CambioDevolucion",
+        foreign_keys="CambioDevolucion.orden_venta_id",
+        back_populates="orden_venta",
+        lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return f"<OrdenVenta(id={self.id}, cliente='{self.codigo_cliente}', total={self.total}, tipo='{self.tipo_venta}')>"
