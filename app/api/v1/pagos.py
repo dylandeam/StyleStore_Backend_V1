@@ -700,6 +700,13 @@ async def get_payment_receipt(
                 "subtotal": d.subtotal,
             })
 
+    # Algunas órdenes históricas de cambios quedaron con total 0 aunque sus
+    # líneas sí tenían importe. El recibo debe representar el dinero cobrado.
+    total_lineas = sum((Decimal(str(item["subtotal"] or 0)) for item in items), Decimal("0.00"))
+    total_recibo = orden.total if orden and orden.total and orden.total > 0 else pago.monto
+    if not total_recibo or total_recibo <= 0:
+        total_recibo = total_lineas
+
     return {
         "pago_id": pago.id,
         "recibo_numero": pago.recibo_numero,
@@ -720,7 +727,7 @@ async def get_payment_receipt(
         "comprador_nombre": orden.comprador_nombre if orden else None,
         "comprador_ci": orden.comprador_ci if orden else None,
         "items": items,
-        "total": orden.total if orden else pago.monto,
+        "total": total_recibo,
     }
 
 
