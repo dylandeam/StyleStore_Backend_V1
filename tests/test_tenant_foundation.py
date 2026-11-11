@@ -793,6 +793,42 @@ def test_platform_admin_creates_global_plan_and_sees_subscription_duration(clien
     assert summary["total"] == 1
     assert summary["activas"] == 1
 
+    in_use_delete = client.delete(
+        "/api/v1/planes/admin/empresarial", headers=master_headers
+    )
+    assert in_use_delete.status_code == 400
+    assert "suscripciones o pagos" in in_use_delete.json()["detail"]
+
+
+def test_platform_admin_deletes_unused_custom_plan_but_not_base_plans(client, db_session, admin_token):
+    platform_admin = db_session.query(User).filter(User.email == "admin_test@stylestore.com").one()
+    platform_admin.is_platform_admin = True
+    db_session.commit()
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    created = client.post(
+        "/api/v1/planes/admin",
+        headers=headers,
+        json={
+            "codigo": "temporal",
+            "nombre": "Temporal",
+            "precio_mensual": 120,
+            "moneda": "BOB",
+            "max_sucursales": 3,
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    deleted = client.delete("/api/v1/planes/admin/temporal", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+    plans = client.get("/api/v1/planes/admin", headers=headers)
+    assert plans.status_code == 200
+    assert all(item["codigo"] != "temporal" for item in plans.json())
+
+    protected = client.delete("/api/v1/planes/admin/basico", headers=headers)
+    assert protected.status_code == 400
+    assert "planes base" in protected.json()["detail"]
+
 
 def test_basic_plan_blocks_third_active_branch(client, db_session, admin_token):
     platform_admin = db_session.query(User).filter(User.email == "admin_test@stylestore.com").one()

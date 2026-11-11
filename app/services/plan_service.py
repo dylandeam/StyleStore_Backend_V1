@@ -247,6 +247,51 @@ class PlanService:
         )
         return plan
 
+    def delete_global_plan(self, codigo: str, current_user: User) -> None:
+        """Delete an unused custom global plan and its tenant copies.
+
+        Contracts are immutable commercial evidence, so a plan referenced by any
+        current or historical subscription must be hidden instead of deleted.
+        """
+        self.resolve_admin_scope(current_user, None)
+        self.seed_global_plans()
+        code = codigo.strip().lower()
+        if code in PLAN_CODES:
+            raise BadRequestException(
+                "Los planes Básico, Intermedio y Profesional son planes base y no se pueden eliminar."
+            )
+
+        global_plan = self.db.query(PlanSuscripcion).filter(
+            PlanSuscripcion.scope_key == "global",
+            PlanSuscripcion.codigo == code,
+        ).first()
+        if not global_plan:
+            raise NotFoundException("Plan global no encontrado.")
+
+        plan_ids = [row[0] for row in self.db.query(PlanSuscripcion.id).filter(
+            PlanSuscripcion.codigo == code
+        ).all()]
+        contracts = self.db.query(ContratacionPlan.id).filter(
+            ContratacionPlan.plan_id.in_(plan_ids)
+        ).count()
+        if contracts:
+            raise BadRequestException(
+                "No se puede eliminar porque el plan tiene suscripciones o pagos registrados. "
+                "Desactiva «Plan visible» para dejar de ofrecerlo sin perder el historial."
+            )
+
+        deleted_name = global_plan.nombre
+        self.db.query(PlanSuscripcion).filter(
+            PlanSuscripcion.codigo == code
+        ).delete(synchronize_session=False)
+        self.db.commit()
+        BitacoraService.registrar(
+            db=self.db,
+            user=current_user,
+            action=f"Eliminó el plan global {deleted_name} ({code})",
+            module="planes",
+        )
+
     def subscription_overview(self, current_user: User) -> dict:
         self.resolve_admin_scope(current_user, None)
         plans = self.list_plans(None)

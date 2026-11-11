@@ -1,5 +1,5 @@
 """Public, tenant-admin and platform-admin subscription plan endpoints."""
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_optional_current_user
@@ -84,6 +84,20 @@ async def update_admin_plan(
     db: Session = Depends(get_db),
 ):
     return PlanService(db).update_plan(codigo, payload, current_user, empresa_id)
+
+
+@router.delete(
+    "/admin/{codigo}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Eliminar un plan global personalizado",
+)
+async def delete_admin_plan(
+    codigo: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    PlanService(db).delete_global_plan(codigo, current_user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/contratar", response_model=ContratacionResponse, summary="Contratar o cambiar plan")
