@@ -1,6 +1,7 @@
 """Conciliación idempotente de PayPal, inventario y reembolsos automáticos."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -19,6 +20,11 @@ from app.services.paypal_service import paypal_service
 
 
 class PaymentReconciliationService:
+    # Evita que dos pestañas del mismo proceso intenten capturar la misma orden
+    # de PayPal simultáneamente. asyncio.Lock cede el event loop mientras espera,
+    # a diferencia de un SELECT FOR UPDATE ejecutado antes de una llamada HTTP.
+    _payment_locks: dict[int, asyncio.Lock] = {}
+
     def __init__(self, db: Session):
         self.db = db
 
@@ -31,11 +37,18 @@ class PaymentReconciliationService:
         return fallback
 
     async def reconcile(self, payment: Pago) -> tuple[Pago, str]:
-        """Consulta/captura PayPal y deja un único resultado durable en la BD."""
+        """Consulta/captura PayPal sin bloquear el servidor durante la espera HTTP."""
+        payment_id = int(payment.id)
+        lock = self._payment_locks.setdefault(payment_id, asyncio.Lock())
+        async with lock:
+            return await self._reconcile(payment_id)
+
+    async def _reconcile(self, payment_id: int) -> tuple[Pago, str]:
+        # Fase 1: leer y liberar inmediatamente la conexión/transacción. Nunca se
+        # debe conservar un bloqueo de PostgreSQL mientras esperamos a PayPal.
         payment = (
             self.db.query(Pago)
-            .filter(Pago.id == payment.id)
-            .with_for_update(of=Pago)
+            .filter(Pago.id == payment_id)
             .one()
         )
         payment.operation_uuid = payment.operation_uuid or str(uuid4())
@@ -51,15 +64,35 @@ class PaymentReconciliationService:
             self.db.commit()
             return payment, "El pago todavía no tiene una orden PayPal asociada."
 
+        paypal_order_id = payment.paypal_order_id
+        # También libera la transacción de solo lectura iniciada por SQLAlchemy.
+        self.db.commit()
+
         remote = await paypal_service.get_order(
-            payment.paypal_order_id, allow_mock=settings.ALLOW_MOCK_PAYPAL
+            paypal_order_id, allow_mock=settings.ALLOW_MOCK_PAYPAL
         )
         remote_status = str(remote.get("status") or "").upper()
         if remote_status == "APPROVED":
             remote = await paypal_service.capture_order(
-                payment.paypal_order_id, allow_mock=settings.ALLOW_MOCK_PAYPAL
+                paypal_order_id, allow_mock=settings.ALLOW_MOCK_PAYPAL
             )
             remote_status = str(remote.get("status") or "").upper()
+
+        # Fase 2: bloquear solo durante la mutación local. Otro worker puede haber
+        # conciliado el pago mientras se consultaba PayPal, por eso se revalida.
+        payment = (
+            self.db.query(Pago)
+            .filter(Pago.id == payment_id)
+            .with_for_update(of=Pago)
+            .one()
+        )
+        order = payment.orden_venta
+        if payment.estado == "aprobado" and order.estado == "pagada":
+            self.db.commit()
+            return payment, "El pago ya estaba confirmado."
+        if payment.estado == "reembolsado":
+            self.db.commit()
+            return payment, "El pago fue reembolsado por conflicto de stock."
         if remote_status not in {"COMPLETED", "SAVED"}:
             self.db.commit()
             return payment, "PayPal aún no registra una aprobación completada."

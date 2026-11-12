@@ -427,7 +427,10 @@ async def reconcile_pending_paypal_orders(
         query = scope_by_sucursal(query, db, current_user, OrdenVenta.sucursal_id)
 
     results: list[PayPalReconciliationItem] = []
-    for candidate in query.order_by(Pago.id.asc()).limit(25).all():
+    # Un lote acotado evita que una degradación externa de PayPal mantenga una
+    # petición abierta durante varios minutos. Las siguientes llamadas continúan
+    # con los pendientes restantes de forma idempotente.
+    for candidate in query.order_by(Pago.id.asc()).limit(8).all():
         payment, message = await PaymentReconciliationService(db).reconcile(candidate)
         results.append(PayPalReconciliationItem(
             orden_venta_id=payment.orden_venta_id,
