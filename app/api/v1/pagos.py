@@ -48,6 +48,7 @@ from app.services.offline_checkout_service import OfflineCheckoutService
 from app.services.promocion_service import PromocionService
 from app.services.plan_service import PlanService
 from app.services.notificacion_service import NotificacionService
+from app.services.cambio_service import CambioService
 
 router = APIRouter(prefix="/pagos", tags=["Pagos"])
 
@@ -466,6 +467,41 @@ async def process_caja_payment(
         raise BadRequestException("Esta orden ya ha sido cobrada y está pagada.")
 
     metodo = (payload.metodo_pago or "efectivo").lower()
+
+    # Una orden de ajuste nunca debe cobrarse como una venta genérica: su cierre
+    # también mueve ambas existencias, completa la solicitud y avisa al cliente.
+    if orden.cambio_ajuste:
+        solicitud = orden.cambio_ajuste
+        es_reembolso = Decimal(solicitud.monto_reembolsado or 0) > 0
+        completada = CambioService(db, current_user).completar_en_caja(
+            solicitud.id,
+            metodo_pago_diferencia=None if es_reembolso else metodo,
+            efectivo_recibido=None if es_reembolso else payload.efectivo_recibido,
+            metodo_reembolso=metodo if es_reembolso else None,
+        )
+        pago_ajuste = (
+            db.query(Pago)
+            .filter(Pago.orden_venta_id == orden.id)
+            .order_by(Pago.id.desc())
+            .first()
+        )
+        BitacoraService.registrar(
+            db=db,
+            user=current_user,
+            action=f"Completó cambio/devolución #{completada.id} desde caja; nota {completada.nota_venta_numero}",
+            module="cambios",
+        )
+        return CobroCajaResponse(
+            pago_id=pago_ajuste.id if pago_ajuste else 0,
+            orden_venta_id=orden.id,
+            total=orden.total,
+            efectivo_recibido=payload.efectivo_recibido if not es_reembolso else Decimal("0.00"),
+            cambio_devuelto=Decimal("0.00"),
+            ticket_numero=completada.nota_venta_numero or f"CAM-{completada.id:08d}",
+            recibo_numero=pago_ajuste.recibo_numero if pago_ajuste else None,
+            fecha=datetime.now(),
+        )
+
     if metodo == "qr":
         monto_recibido = orden.total
         cambio = Decimal("0.00")

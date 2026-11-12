@@ -155,6 +155,10 @@ class CambioService:
         offset: int = 0,
     ) -> List[CambioDevolucion]:
         """Lista solicitudes para el panel de administración / encargado."""
+        # Repara de forma idempotente liquidaciones que hayan sido cobradas por
+        # el endpoint genérico de caja antes de que existiera el cierre unificado.
+        # Así el estado, inventario y confirmación del cliente nunca divergen.
+        self.conciliar_liquidaciones_pagadas()
         q = self.db.query(CambioDevolucion).options(
             joinedload(CambioDevolucion.orden_venta).joinedload(OrdenVenta.cliente).joinedload(Cliente.user),
             joinedload(CambioDevolucion.detalle_venta),
@@ -170,6 +174,43 @@ class CambioService:
             q = q.filter(CambioDevolucion.estado == estado)
 
         return q.order_by(CambioDevolucion.id.desc()).offset(offset).limit(limit).all()
+
+    def conciliar_liquidaciones_pagadas(self) -> int:
+        """Completa ajustes pagados que todavía figuran pendientes de liquidación."""
+        pendientes = self._scope_branch(
+            self.db.query(CambioDevolucion).join(
+                OrdenVenta, CambioDevolucion.orden_ajuste_id == OrdenVenta.id
+            ),
+            CambioDevolucion.sucursal_id,
+        ).filter(
+            CambioDevolucion.estado == "pendiente_liquidacion",
+            OrdenVenta.estado == "pagada",
+        ).all()
+
+        completadas = 0
+        for solicitud in pendientes:
+            pago = (
+                self.db.query(Pago)
+                .filter(Pago.orden_venta_id == solicitud.orden_ajuste_id)
+                .order_by(Pago.id.desc())
+                .first()
+            )
+            metodo = (
+                (pago.metodo_pago if pago else None)
+                or (solicitud.orden_ajuste.metodo_pago if solicitud.orden_ajuste else None)
+                or "efectivo"
+            ).lower()
+            if metodo not in {"efectivo", "qr", "transferencia"}:
+                metodo = "efectivo"
+            metodo_cobro = metodo if metodo in {"efectivo", "qr"} else "efectivo"
+            self.completar_en_caja(
+                solicitud.id,
+                metodo_pago_diferencia=metodo_cobro if Decimal(solicitud.monto_adicional or 0) > 0 else None,
+                efectivo_recibido=Decimal(solicitud.monto_adicional or 0),
+                metodo_reembolso=metodo if Decimal(solicitud.monto_reembolsado or 0) > 0 else None,
+            )
+            completadas += 1
+        return completadas
 
     def listar_mis_solicitudes(self, user: User) -> List[CambioDevolucion]:
         """Lista las solicitudes del cliente autenticado."""
@@ -530,6 +571,8 @@ class CambioService:
         ).filter(CambioDevolucion.id == solicitud_id).first()
         if not solicitud:
             raise HTTPException(status_code=404, detail="Solicitud no encontrada.")
+        if solicitud.estado == "completada":
+            return solicitud
         if solicitud.estado != "pendiente_liquidacion" or not solicitud.orden_ajuste:
             raise HTTPException(status_code=400, detail="Primero debes preparar el ajuste y enviarlo a caja.")
 
@@ -569,34 +612,41 @@ class CambioService:
         if not cliente or not cliente.user:
             raise HTTPException(status_code=400, detail="No se pudo identificar al cliente del cambio.")
         orden_ajuste = solicitud.orden_ajuste
+        pago = (
+            self.db.query(Pago)
+            .filter(Pago.orden_venta_id == orden_ajuste.id)
+            .order_by(Pago.id.desc())
+            .first()
+        )
         metodo = metodo_cobro if monto_adicional > 0 else metodo_salida if monto_reembolso > 0 else "sin_ajuste"
         orden_ajuste.estado = "pagada"
         orden_ajuste.metodo_pago = metodo
         orden_ajuste.inventario_descontado = True
-        pago = None
         if monto_adicional > 0:
-            pago = Pago(
-                orden_venta_id=orden_ajuste.id,
-                monto=monto_adicional,
-                empresa_id=solicitud.sucursal.empresa_id,
-                tipo_pago="en caja",
-                metodo_pago=metodo,
-                estado="aprobado",
-            )
-            self.db.add(pago)
+            if not pago:
+                pago = Pago(
+                    orden_venta_id=orden_ajuste.id,
+                    monto=monto_adicional,
+                    empresa_id=solicitud.sucursal.empresa_id,
+                )
+                self.db.add(pago)
+            pago.tipo_pago = "en caja"
+            pago.metodo_pago = metodo
+            pago.estado = "aprobado"
         elif monto_reembolso > 0:
-            pago = Pago(
-                orden_venta_id=orden_ajuste.id,
-                monto=monto_reembolso,
-                empresa_id=solicitud.sucursal.empresa_id,
-                tipo_pago="devolucion en caja",
-                metodo_pago=metodo,
-                estado="reembolsado",
-                refund_reason=f"Liquidación de cambio/devolución #{solicitud.id}",
-                refunded_at=datetime.now(),
-                recibo_numero=f"DEV-{orden_ajuste.id:08d}",
-            )
-            self.db.add(pago)
+            if not pago:
+                pago = Pago(
+                    orden_venta_id=orden_ajuste.id,
+                    monto=monto_reembolso,
+                    empresa_id=solicitud.sucursal.empresa_id,
+                )
+                self.db.add(pago)
+            pago.tipo_pago = "devolucion en caja"
+            pago.metodo_pago = metodo
+            pago.estado = "reembolsado"
+            pago.refund_reason = f"Liquidación de cambio/devolución #{solicitud.id}"
+            pago.refunded_at = datetime.now()
+            pago.recibo_numero = pago.recibo_numero or f"DEV-{orden_ajuste.id:08d}"
 
         solicitud.estado = "completada"
         solicitud.metodo_pago_diferencia = metodo

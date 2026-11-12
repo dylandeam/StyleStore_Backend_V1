@@ -25,7 +25,7 @@ from app.models.stock_inventario import StockInventario
 from app.models.orden_venta import OrdenVenta, DetalleVenta
 from app.models.pago import Pago
 from app.models.empresa import Empresa
-from app.models.cambio_devolucion import SaldoFavorCliente
+from app.models.cambio_devolucion import CambioDevolucion, SaldoFavorCliente
 from app.models.envio import Envio
 from app.models.notificacion import Notificacion
 from app.core.security import create_access_token
@@ -778,6 +778,62 @@ def test_cambio_mayor_exige_y_registra_cobro(client: TestClient, auth_tokens, sa
     assert Decimal(str(completado.json()["monto_adicional"])) == Decimal("150.00")
     orden_ajuste_id = completado.json()["orden_ajuste_id"]
     assert db_session.query(Pago).filter(Pago.orden_venta_id == orden_ajuste_id, Pago.monto == Decimal("150.00")).one()
+
+
+def test_cobro_generico_de_ajuste_completa_cambio_y_lo_confirma_al_cliente(
+    client: TestClient, auth_tokens, sample_inventory, db_session
+):
+    """Regresión: caja no puede dejar pagado el ajuste y pendiente la solicitud."""
+    headers_cli = {"Authorization": f"Bearer {auth_tokens['client_token']}"}
+    headers_adm = {"Authorization": f"Bearer {auth_tokens['admin_token']}"}
+    stock = sample_inventory["stock"]
+    stock.precio_variante = Decimal("180.00")
+    stock.cantidad = max(stock.cantidad, 3)
+    orden = OrdenVenta(
+        fecha=date.today(), estado="pagada", total=Decimal("100.00"), tipo_venta="presencial",
+        codigo_cliente=auth_tokens["client_profile"].codigo, sucursal_id=stock.sucursal_id,
+    )
+    db_session.add(orden); db_session.flush()
+    detalle = DetalleVenta(
+        orden_venta_id=orden.id, stock_inventario_id=stock.id,
+        producto_nombre="Prenda original caja", cantidad=1,
+        precio_unitario=Decimal("100.00"), subtotal=Decimal("100.00"),
+    )
+    db_session.add(detalle); db_session.commit()
+
+    creada = client.post("/api/v1/cambios", json={
+        "orden_venta_id": orden.id, "detalle_venta_id": detalle.id, "tipo": "cambio",
+        "motivo": "talla_incorrecta", "sucursal_id": stock.sucursal_id,
+        "fecha_programada": str(date.today()), "descripcion_problema": "Cambio liquidado desde caja",
+    }, headers=headers_cli)
+    solicitud_id = creada.json()["solicitud_id"]
+    assert client.put(f"/api/v1/cambios/{solicitud_id}/responder", json={
+        "nuevo_estado": "aceptada", "respuesta_encargado": "Aprobado",
+    }, headers=headers_adm).status_code == 200
+    preparada = client.post(f"/api/v1/cambios/{solicitud_id}/preparar-liquidacion", json={
+        "reponer_prenda_original": True, "nuevo_stock_inventario_id": stock.id,
+    }, headers=headers_adm)
+    assert preparada.status_code == 200, preparada.text
+
+    orden_ajuste_id = preparada.json()["orden_ajuste_id"]
+    cobro = client.post("/api/v1/pagos/caja", json={
+        "orden_venta_id": orden_ajuste_id,
+        "efectivo_recibido": 100,
+        "metodo_pago": "efectivo",
+    }, headers=headers_adm)
+    assert cobro.status_code == 200, cobro.text
+
+    db_session.expire_all()
+    solicitud = db_session.get(CambioDevolucion, solicitud_id)
+    assert solicitud.estado == "completada"
+    assert solicitud.orden_ajuste.estado == "pagada"
+    assert db_session.query(Pago).filter(Pago.orden_venta_id == orden_ajuste_id).count() == 1
+
+    vista_cliente = client.get("/api/v1/cambios/mis-solicitudes", headers=headers_cli)
+    assert vista_cliente.status_code == 200
+    registro = next(item for item in vista_cliente.json() if item["id"] == solicitud_id)
+    assert registro["estado"] == "completada"
+    assert registro["nota_venta_numero"]
 
 
 def test_cambio_entre_variantes_repone_original_y_descuenta_reemplazo(
